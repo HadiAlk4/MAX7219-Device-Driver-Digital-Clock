@@ -21,7 +21,22 @@ static struct class *my_class;
 
 static int my_open(struct inode *inode, struct file *file) { return 0; }
 static int my_release(struct inode *inode, struct file *file) { return 0; }
-static ssize_t my_read(struct file *file, char __user *buf, size_t len, loff_t *off) { return 0; }
+ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t *fpos){
+    int i,ret;
+    unsigned char *kernel_buf;
+    pr_info("my_read: READ \r\n");
+    kernel_buf=(unsigned char *) kmalloc(sizeof(unsigned char)*count,1);
+    if(!kernel_buf) return -ENOMEM;
+
+    //If all data read successly return count otherwise signal the end-of-file.
+    for(i=0;i<count;i++) kernel_buf[i]=i;
+    if(copy_to_user(user_buf, kernel_buf, i)) ret=-EFAULT;
+    else if(i==count) ret=count;
+    else ret=0;
+    kfree(kernel_buf);
+    return(ret);
+}
+
 static ssize_t my_write(struct file *file, const char __user *buf, size_t count, loff_t *off)
 {
     int i;
@@ -67,6 +82,31 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
     return ret;
 }
 
+loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
+    unsigned char caddr;
+    // check the possible seek methods
+    switch (whence)
+        {
+        case 0: // SEEKSET
+                pr_info("my_seek: Seek set to offset \r\n");
+            break ;
+        
+        case 1: // SEEKCURRENT
+                pr_info("my_seek: Seek set to current position + offset\r\n");
+            break ;
+            
+        case 2: // SEEKEND
+                pr_info("my_seek: Seek set to end-of-file minus offset\r\n");
+            break ;
+        default:
+            return(-EINVAL) ; // naughty argument
+        }
+    caddr=0;
+    filep->f_pos=caddr;
+    return(caddr) ;
+}
+
+
 static struct file_operations fops =
 {
     .owner = THIS_MODULE,
@@ -75,6 +115,7 @@ static struct file_operations fops =
     .read = my_read,
     .write = my_write,
     .unlocked_ioctl = my_ioctl,
+    .llseek     = my_llseek,
 };
 
 
