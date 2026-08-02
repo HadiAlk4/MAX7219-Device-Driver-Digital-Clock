@@ -1,0 +1,22 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build artifacts & compiled objects (Make/GCC)
+*.o
+*.ko
+*.mod.c
+*.mod
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Editor/IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
