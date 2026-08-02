@@ -128,6 +128,8 @@ static int __init screen_init(void)
         return -1;
     }
 
+    start_display();
+
     // register major/minor number
     if(alloc_chrdev_region(&dev, 0,1, DEVICE_NAME) < 0) return -1;
 
@@ -151,6 +153,7 @@ static int __init screen_init(void)
 
 static void __exit screen_exit(void)
 {
+    screen_send_bits(0x0C, 0x00);
     device_destroy(my_class, dev);
     class_destroy(my_class);
     cdev_del(&my_cdev);
