@@ -102,21 +102,21 @@ void screen_send_bits(unsigned char address, unsigned char data)
 
 void start_display(void)
 {
-    pr_info("MAX7219: Waking up display...\n");
+    pr_info("MAX7219 screen: start up display\n");
 
-    // 1. Decode Mode (Table 4) - Standard numbers for all 8 digits
+    // Decode Mode
     screen_send_bits(0x09, 0xFF);
 
-    // 2. Intensity (Table 7) - Medium brightness
-    screen_send_bits(0x0A, 0x08);
+    // Intensity
+    screen_send_bits(0x0A, 0x0F);
 
-    // 3. Scan Limit (Table 8) - Activate all 8 digits
+    // Scan Limit
     screen_send_bits(0x0B, 0x07);
 
-    // 4. Shutdown Register (Table 3) - Wake up / Normal operation
+    // Shutdown Register
     screen_send_bits(0x0C, 0x01);
 
-    // 5. Display Test (Table 10) - Ensure test mode is OFF
+    // Display Test
     screen_send_bits(0x0F, 0x00);
 
     pr_info("MAX7219: Display initialized and ready.\n");

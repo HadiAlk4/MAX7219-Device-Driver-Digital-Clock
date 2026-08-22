@@ -5,12 +5,13 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/ioctl.h>
+#include <linux/delay.h>
 #include "gpio_setup.h"
 
 
 
 #define SCREEN_TO_MAGIC 'k'
-#define SCREEN_CTL1     _IO(SCREEN_TO_MAGIC, 1)
+#define SCREEN_CTL1_DISABLE     _IO(SCREEN_TO_MAGIC, 1)
 #define SCREEN_CTL2     _IOR(SCREEN_TO_MAGIC,2,char)
 #define SCREEN_CTL3     _IOW(SCREEN_TO_MAGIC,3,char)
 #define DEVICE_NAME "max_screen"
@@ -19,28 +20,69 @@ static dev_t dev;
 static struct cdev my_cdev;
 static struct class *my_class;
 
-static int my_open(struct inode *inode, struct file *file) { return 0; }
-static int my_release(struct inode *inode, struct file *file) { return 0; }
-ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t *fpos){
+static int my_open(struct inode *inode, struct file *file)
+{
+
+    char *buff = kzalloc(8*sizeof(char), 1); // check over this and maybe use a directive
+
+    if(!buff)
+    {
+        return -ENOMEM;
+    }
+
+    file->private_data = buff;
+    screen_send_bits(0x0F, 0x01); // Display Test
+    msleep(5000);
+    screen_send_bits(0x0F, 0x00);
+
+    file->f_pos = 0;
+    return 0;
+}
+static int my_release(struct inode *inode, struct file *file)
+{
+    pr_info("my_release: release");
+
+    for(int i=1;i<=8;i++)
+    {
+        screen_send_bits(i, 0x0F);
+    }
+    if(file->private_data){
+        kfree(file->private_data);
+    }
+    return 0;
+}
+
+ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t *fpos){ // use private data field and attach the buffer to that // note -- change it to just use buff directly
     int i,ret;
     unsigned char *kernel_buf;
+
+    char *buff = (char *)filep->private_data;
+    int cursor = filep->f_pos;
+
     pr_info("my_read: READ \r\n");
+
+    if(*fpos > 0) return 0; // kills infinte loop as the secound loop would be more than zero after the first one runs
+
     kernel_buf=(unsigned char *) kmalloc(sizeof(unsigned char)*count,1);
     if(!kernel_buf) return -ENOMEM;
 
-    //If all data read successly return count otherwise signal the end-of-file.
-    for(i=0;i<count;i++) kernel_buf[i]=i;
+    for(i=0;i<count;i++) kernel_buf[i]=buff[i];
     if(copy_to_user(user_buf, kernel_buf, i)) ret=-EFAULT;
     else if(i==count) ret=count;
     else ret=0;
     kfree(kernel_buf);
+
+    *fpos = ret;
+
     return(ret);
 }
 
-static ssize_t my_write(struct file *file, const char __user *buf, size_t count, loff_t *off)
+static ssize_t my_write(struct file *file, const char __user *buf, size_t count, loff_t *off) // perhaps make a fixed count Directive for all
 {
     int i;
     unsigned char *kernel_buf;
+    int curr = file->f_pos;
+    char *buffer = (char *)file->private_data;
 
     pr_info("screen my_write: \r\n");
     kernel_buf=(unsigned char *) kmalloc(sizeof(unsigned char)*count, 1);
@@ -50,10 +92,38 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
 
     for(i=0;i<count;i++)
     {
+    char c = kernel_buf[i];
+    unsigned char val = 0x0F;
+    
+    if(c == '\n' || c == '\r')
+    {
+        continue;
+    }
+    
+    if(c >= '0' && c <= '9')
+    {
+        val = c - '0';
+    }
+    else if (c == 'E')
+    {
+        val = 0x10;
+    }
+    
+    screen_send_bits(curr+1, val);
+    
+    buffer[curr] = c;
+    
+    
+    curr++;
+    if(curr >= 8) curr = 0;
+    
         pr_info("screen my_write: %c \r\n", kernel_buf[i]);
     }
     kfree(kernel_buf);
-    return(i);
+    
+    file->f_pos = curr;
+    
+    return count;
 
 }
 static long my_ioctl( struct file *filep, unsigned int command, unsigned long arg)
@@ -61,11 +131,20 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
 
     unsigned char status=0x0;
     int ret=0;
+    int curr = filep->f_pos;
+    char *buffer = (char *)filep->private_data;
+    char val = 0x0F;
+    
 
     switch(command)
     {
-        case SCREEN_CTL1:
-            pr_info("EXECUTING SCREEN_CTL1\n");
+        case SCREEN_CTL1_DISABLE:
+            pr_info("EXECUTING SCREEN_CTL1 DISABLE\n");
+        for(int i = 0; i < 8; i++)
+        {
+        screen_send_bits(i, 0x0F);
+        buffer[i-1] = ' ';
+        }
             break;
         case SCREEN_CTL2: // read
             ret=__get_user(status,(unsigned char *) arg);
@@ -83,27 +162,30 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
 }
 
 loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
-    unsigned char caddr;
+    unsigned char curr = filep->f_pos;
+    
     // check the possible seek methods
     switch (whence)
         {
         case 0: // SEEKSET
                 pr_info("my_seek: Seek set to offset \r\n");
+                curr = offset;
             break ;
         
         case 1: // SEEKCURRENT
                 pr_info("my_seek: Seek set to current position + offset\r\n");
+                curr = filep->f_pos + offset;
             break ;
             
         case 2: // SEEKEND
                 pr_info("my_seek: Seek set to end-of-file minus offset\r\n");
+                curr = 8 + offset;
             break ;
         default:
             return(-EINVAL) ; // naughty argument
         }
-    caddr=0;
-    filep->f_pos=caddr;
-    return(caddr) ;
+    filep->f_pos=curr;
+    return(curr) ;
 }
 
 
