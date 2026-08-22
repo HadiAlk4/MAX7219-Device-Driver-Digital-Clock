@@ -148,6 +148,9 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
             break;
         case SCREEN_CTL2: // read
             ret=__get_user(status,(unsigned char *) arg);
+
+            if( status > 0x0F) status = 0x0F;
+            screen_send_bits(0x0A, status);
             pr_info("EXECUTING SCREEN_CTL2 (0x%x)\n", status);
             break;
         case SCREEN_CTL3: // write
