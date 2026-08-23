@@ -1,3 +1,4 @@
+
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
@@ -23,7 +24,7 @@ static struct class *my_class;
 static char brightness_settings = 0x0F;
 static int decimal_toggle = 1;
 
-static char get_val(char c)
+static char translate_char(char c)
 {
 if(c >= '0' && c <= '9') return c - '0';
 if (c == 'E' || c == 'e') return 0x0B;
@@ -77,6 +78,11 @@ static ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t
 
     if(*fpos > 0) return 0; // kills infinte loop as the secound loop would be more than zero after the first one runs
 
+    if (count > filep->f_pos) {
+        count = filep->f_pos;
+    }
+    if (count == 0) return 0;
+
     kernel_buf=(unsigned char *) kmalloc(sizeof(unsigned char)*count,1);
     if(!kernel_buf) return -ENOMEM;
 
@@ -104,60 +110,38 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
 
     if(copy_from_user(kernel_buf, buf, count)) return -EFAULT;
 
+    screen_send_bits(8 - curr, translate_char(buffer[curr]));
+
     for(i=0;i<count;i++)
     {
     char c = kernel_buf[i];
     unsigned char val = 0x0F;
-    
+
     if(c == '\n' || c == '\r')
     {
         continue;
     }
-    
-    if(c >= '0' && c <= '9')
-    {
-        val = c - '0';
-    }
-    else if (c == 'E' || c == 'e')
-    {
-        val = 0x0B;
-    }
-    else if (c == 'H' || c == 'h')
-    {
-        val = 0x0C;
-    }
-    else if (c == 'L' || c == 'l')
-    {
-        val = 0x0D;
-    }
-    else if (c == 'P' || c == 'p')
-    {
-        val = 0x0E;
-    }
-    else if (c == '-')
-    {
-        val = 0xA;
-    }
-    else if (c == ' ')
-    {
-        val = 0x0F;
-    }
-
-    
-    screen_send_bits(8 - curr, val); // screen_send_bits(curr+1, val);
-    
     buffer[curr] = c;
-    
-    
+    screen_send_bits(8 - curr, translate_char(c));
+
+
     curr++;
     if(curr >= 8) curr = 0;
-    
+
         pr_info("screen my_write: %c \r\n", kernel_buf[i]);
     }
+
+    char isToggled = translate_char(buffer[curr]);
+    if(decimal_toggle)
+    {
+        isToggled |= 0x80;
+    }
+    screen_send_bits(8 - curr, isToggled);
+
     kfree(kernel_buf);
-    
+
     file->f_pos = curr;
-    
+
     return count;
 
 }
@@ -169,7 +153,7 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
     int curr = filep->f_pos;
     char *buffer = (char *)filep->private_data;
     char val = 0x0F;
-    
+
 
     switch(command)
     {
@@ -181,6 +165,10 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
         buffer[i-1] = ' '; // clear the internal private data buffer
         }
             filep->f_pos = 0;
+            if(decimal_toggle)
+            {
+                screen_send_bits(8, translate_char(' ') | 0x80);
+            }
             break;
         case SCREEN_CTL2_WRITE:
             ret=__get_user(status,(unsigned char *) arg);
@@ -197,6 +185,14 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
         case SCREEN_CTL4_TOGGLE:
             ret=__get_user(decimal_toggle, (int *)arg);
             pr_info("EXECUTING SCREEN_CTL4, CURSOR TOGGLED TO: %d\n", decimal_toggle);
+
+            if (decimal_toggle)
+            {
+                screen_send_bits(8 - curr, translate_char(buffer[curr]) | 0x80);
+            } else {
+                screen_send_bits(8 - curr, translate_char(buffer[curr]));
+            }
+
             break;
         default:
             ret= -ENOTTY;
@@ -206,7 +202,8 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
 
 static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
     unsigned char curr = filep->f_pos;
-    
+    char *buffer = (char *)filep->private_data;
+    screen_send_bits(8 - curr, translate_char(buffer[curr]));
     // check the possible seek methods
     switch (whence)
         {
@@ -214,12 +211,12 @@ static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dumm
                 pr_info("my_seek: Seek set to offset \r\n");
                 curr = offset;
             break ;
-        
+
         case 1: // SEEKCURRENT
                 pr_info("my_seek: Seek set to current position + offset\r\n");
                 curr = filep->f_pos + offset;
             break ;
-            
+
         case 2: // SEEKEND
                 pr_info("my_seek: Seek set to end-of-file minus offset\r\n");
                 curr = 8 + offset;
@@ -227,6 +224,15 @@ static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dumm
         default:
             return(-EINVAL) ; // naughty argument
         }
+
+    if(curr > 7) curr = 7;
+    if(curr < 0) curr = 0;
+    char isToggled = translate_char(buffer[curr]);
+    if(decimal_toggle)
+    {
+        isToggled |= 0x80;
+    }
+    screen_send_bits(8 - curr, isToggled);
     filep->f_pos=curr;
     return(curr) ;
 }
