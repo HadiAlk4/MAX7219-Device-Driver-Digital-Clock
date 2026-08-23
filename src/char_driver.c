@@ -12,13 +12,27 @@
 
 #define SCREEN_TO_MAGIC 'k'
 #define SCREEN_CTL1_DISABLE     _IO(SCREEN_TO_MAGIC, 1)
-#define SCREEN_CTL2     _IOR(SCREEN_TO_MAGIC,2,char)
-#define SCREEN_CTL3     _IOW(SCREEN_TO_MAGIC,3,char)
+#define SCREEN_CTL2_WRITE     _IOR(SCREEN_TO_MAGIC,2,char)
+#define SCREEN_CTL3_READ     _IOW(SCREEN_TO_MAGIC,3,char)
+#define SCREEN_CTL4_CURSOR     _IOW(SCREEN_TO_MAGIC, 4, int)
 #define DEVICE_NAME "max_screen"
 
 static dev_t dev;
 static struct cdev my_cdev;
 static struct class *my_class;
+static char brightness_settings = 0x0F;
+static int decimal_toggle = 1;
+
+static char get_val(char c)
+{
+if(c >= '0' && c <= '9') return c - '0';
+if (c == 'E' || c == 'e') return 0x0B;
+if (c == 'H' || c == 'h') return 0x0C;
+if (c == 'L' || c == 'l') return 0x0D;
+if (c == 'P' || c == 'p') return 0x0E;
+if (c == '-') return 0x0A;
+return 0x0F;
+}
 
 static int my_open(struct inode *inode, struct file *file)
 {
@@ -128,6 +142,7 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
     {
         val = 0x0F;
     }
+
     
     screen_send_bits(8 - curr, val); // screen_send_bits(curr+1, val);
     
@@ -159,24 +174,29 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
     switch(command)
     {
         case SCREEN_CTL1_DISABLE:
-            pr_info("EXECUTING SCREEN_CTL1 DISABLE\n");
-        for(int i = 0; i < 8; i++)
+        pr_info("EXECUTING SCREEN_CTL1 DISABLE\n");
+        for(int i = 1; i <= 8; i++)
         {
         screen_send_bits(i, 0x0F);
-        buffer[i-1] = ' ';
+        buffer[i-1] = ' '; // clear the internal private data buffer
         }
+            filep->f_pos = 0;
             break;
-        case SCREEN_CTL2: // read
+        case SCREEN_CTL2_WRITE:
             ret=__get_user(status,(unsigned char *) arg);
 
             if( status > 0x0F) status = 0x0F;
-            screen_send_bits(0x0A, status);
-            pr_info("EXECUTING SCREEN_CTL2 (0x%x)\n", status);
+            brightness_settings = status;
+            screen_send_bits(0x0A, brightness_settings);
+            pr_info("EXECUTING SCREEN_CTL2 (0x%x)\n", brightness_settings);
             break;
-        case SCREEN_CTL3: // write
-            pr_info("EXECUTING SCREEN_CTL3, RETURNING 0X30\n");
-            status=0x30;
-            ret=__put_user(status,(unsigned char *)arg);
+        case SCREEN_CTL3_READ:
+            pr_info("EXECUTING SCREEN_CTL3, RETURNING (0x%x)\n", brightness_settings);
+            ret=__put_user(brightness_settings,(unsigned char *)arg);
+            break;
+        case SCREEN_CTL4_TOGGLE:
+            ret=__get_user(decimal_toggle, (int *)arg);
+            pr_info("EXECUTING SCREEN_CTL4, CURSOR TOGGLED TO: %d\n", cursor_enabled);
             break;
         default:
             ret= -ENOTTY;
