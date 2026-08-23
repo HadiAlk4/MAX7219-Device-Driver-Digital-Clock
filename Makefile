@@ -16,3 +16,17 @@ all:
 	make -C $(KDIR) M=$(PWD) modules
 clean:
 	make -C $(KDIR) M=$(PWD) clean
+
+program_test_1: all
+	-sudo rmmod max_screen_driver
+	sudo insmod max_screen_driver.ko
+	sudo chmod 666 /dev/max_screen
+	gcc program_test_1.c -o program_test_1
+	./program_test_1
+
+digital_clock: all
+	-sudo rmmod max_screen_driver
+	sudo insmod max_screen_driver.ko
+	sudo chmod 666 /dev/max_screen
+	gcc digital_clock.c -o digital_clock
+	./digital_clock

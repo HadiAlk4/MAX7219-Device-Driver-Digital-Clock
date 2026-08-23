@@ -113,7 +113,7 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
     
     buffer[curr] = c;
     
-    
+     
     curr++;
     if(curr >= 8) curr = 0;
     
