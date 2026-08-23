@@ -3,8 +3,9 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <errno.h>
-
+#include <unistd.h>
 #include <sys/select.h>
+#include <time.h>
 
 
 #define SCREEN_TO_MAGIC 'k'
@@ -19,8 +20,12 @@ int main()
     int fd = open("/dev/max_screen", O_RDWR);
     char fgString[20] = {0};
 
-    fd_set read;
-    struct timeval halt;
+    fd_set read; // check the origin of this
+    struct timeval halt; // check the struct of this
+
+    time_t raw_time_int;
+    struct tm *time_data;
+    char time_string[20];
 
     if(fd < 0)
     {
@@ -31,6 +36,22 @@ int main()
 
     while(1)
     {
+
+        time(&raw_time_int);
+        time_data = localtime(&raw_time_int);
+
+        int normal_time = time_data->tm_hour % 12;
+        if (normal_time == 0)
+        {
+            normal_time = 12;
+        }
+
+        sprintf(time_string, "%02d-%02d-%02d", normal_time, time_data->tm_min, time_data->tm_sec);
+
+
+        lseek(fd, 0, SEEK_SET);
+        write(fd, time_string, 8);
+
         FD_ZERO(&read);
         FD_SET(0, &read);
 

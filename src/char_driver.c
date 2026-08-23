@@ -52,7 +52,7 @@ static int my_release(struct inode *inode, struct file *file)
     return 0;
 }
 
-ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t *fpos){ // use private data field and attach the buffer to that // note -- change it to just use buff directly
+static ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t *fpos){ // use private data field and attach the buffer to that // note -- change it to just use buff directly
     int i,ret;
     unsigned char *kernel_buf;
 
@@ -104,16 +104,36 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
     {
         val = c - '0';
     }
-    else if (c == 'E')
+    else if (c == 'E' || c == 'e')
     {
-        val = 0x10;
+        val = 0x0B;
+    }
+    else if (c == 'H' || c == 'h')
+    {
+        val = 0x0C;
+    }
+    else if (c == 'L' || c == 'l')
+    {
+        val = 0x0D;
+    }
+    else if (c == 'P' || c == 'p')
+    {
+        val = 0x0E;
+    }
+    else if (c == '-')
+    {
+        val = 0xA;
+    }
+    else if (c == ' ')
+    {
+        val = 0x0F;
     }
     
-    screen_send_bits(curr+1, val);
+    screen_send_bits(8 - curr, val); // screen_send_bits(curr+1, val);
     
     buffer[curr] = c;
     
-     
+    
     curr++;
     if(curr >= 8) curr = 0;
     
@@ -164,7 +184,7 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
     return ret;
 }
 
-loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
+static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
     unsigned char curr = filep->f_pos;
     
     // check the possible seek methods
