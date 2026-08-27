@@ -21,7 +21,19 @@ static dev_t dev;
 static struct cdev my_cdev;
 static struct class *my_class;
 static char brightness_settings = 0x0F;
+int cursor_toggle = 0;
 
+
+static char get_val(char c)
+{
+    if(c >= '0' && c <= '9') return c - '0';
+    if (c == 'E' || c == 'e') return 0x0B;
+    if (c == 'H' || c == 'h') return 0x0C;
+    if (c == 'L' || c == 'l') return 0x0D;
+    if (c == 'P' || c == 'p') return 0x0E;
+    if (c == '-') return 0x0A;
+    return 0x0F;
+}
 
 static int my_open(struct inode *inode, struct file *file)
 {
@@ -65,6 +77,11 @@ static ssize_t my_read( struct file *filep, char *user_buf, size_t count, loff_t
     pr_info("my_read: READ \r\n");
 
     if(*fpos > 0) return 0; // kills infinte loop as the secound loop would be more than zero after the first one runs
+
+    if (count > filep->f_pos) { // check this
+        count = filep->f_pos;
+    }
+    if (count == 0) return 0;
 
     kernel_buf=(unsigned char *) kmalloc(sizeof(unsigned char)*count,1);
     if(!kernel_buf) return -ENOMEM;
@@ -143,6 +160,13 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
     
         pr_info("screen my_write: %c \r\n", kernel_buf[i]);
     }
+
+    unsigned char final_val = get_val(buffer[curr]); // check this
+    if (cursor_toggle) {
+        final_val |= 0x80;
+    }
+    screen_send_bits(8 - curr, final_val);
+
     kfree(kernel_buf);
     
     file->f_pos = curr;
@@ -183,7 +207,17 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
             pr_info("EXECUTING SCREEN_CTL3, RETURNING (0x%x)\n", brightness_settings);
             ret=__put_user(brightness_settings,(unsigned char *)arg);
             break;
-       
+        case SCREEN_CTL4_TOGGLE:
+            ret = __get_user(cursor_toggle, (int *)arg);
+            val = get_val(buffer[curr]);
+            if(cursor_toggle)
+            {
+                screen_send_bits( 8 - curr, val | 0x80);
+            } else 
+            {
+                screen_send_bits( 8 - curr, val);
+            }
+            break;
         default:
             ret= -ENOTTY;
     }
@@ -192,6 +226,11 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
 
 static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dummy function needs to implement offset calc without creating global vars
     unsigned char curr = filep->f_pos;
+
+    char *buffer = (char *)filep->private_data;
+
+    // 1. Clear the dot from the old position
+    screen_send_bits(8 - curr, get_val(buffer[curr])); // check these two
     
     // check the possible seek methods
     switch (whence)
@@ -213,6 +252,16 @@ static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dumm
         default:
             return(-EINVAL) ; // naughty argument
         }
+
+
+    if(curr > 7) curr = 7; // check these 
+    if(curr < 0) curr = 0;
+    unsigned char val = get_val(buffer[curr]);
+    if(cursor_toggle) {
+        val |= 0x80;
+    }
+    screen_send_bits(8 - curr, val);
+
     filep->f_pos=curr;
     return(curr) ;
 }
@@ -261,7 +310,7 @@ static int __init screen_init(void)
     return 0;
 
 }
-
+ 
 static void __exit screen_exit(void)
 {
     screen_send_bits(0x0C, 0x00);

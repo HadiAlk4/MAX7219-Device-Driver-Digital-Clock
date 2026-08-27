@@ -13,6 +13,7 @@
 #define SCREEN_CTL1_DISABLE     _IO(SCREEN_TO_MAGIC, 1)
 #define SCREEN_CTL2_WRITE     _IOR(SCREEN_TO_MAGIC,2,char)
 #define SCREEN_CTL3_READ     _IOW(SCREEN_TO_MAGIC,3,char)
+#define SCREEN_CTL4_TOGGLE      _IOW(SCREEN_TO_MAGIC, 4, int)  
 #define DEVICE_NAME "max_screen"
 
 
@@ -32,6 +33,9 @@ int main()
     char brightness = 0x01;
     ioctl(fd, SCREEN_CTL2_WRITE, &brightness);
 
+    time_t alarm_time = 0;
+    int alarm_active = 0;
+
 
     if(fd < 0)
     {
@@ -45,6 +49,45 @@ int main()
 
         time(&raw_time_int);
         time_data = localtime(&raw_time_int);
+
+        if(alarm_active && raw_time_int >= alarm_time)
+        {
+            int alarm_stopped = 0;
+            int scroll_pos = 0;
+            char msg[] = "        -----        "; // check over this 
+            int msg_len = strlen(msg);
+
+            while(!alarm_stopped)
+            {
+                char frame[9] = {0};
+                strncpy(frame, &msg[scroll_pos], 8);
+                lseek(fd, 0, SEEK_SET);
+                write(fd, frame, 8);
+
+                scroll_pos++;
+
+                if(scroll_pos > msg_len - 8) scroll_pos = 0;
+
+                FD_ZERO(&read);
+                FD_SET(0, &read);
+
+                halt.tv_sec = 0;
+                halt.tv_usec = 200000; 
+
+                if(select(1, &read, NULL, NULL, &halt) > 0)
+                {
+                    if(fgets(fgString, sizeof(fgString), stdin) != NULL)
+                    {
+                        if(fgString[0] == '#')
+                        {
+                            alarm_active = 0;
+                            alarm_stopped = 1;
+                            printf("alarm stop");
+                        }
+                    }
+                }
+            }
+        }
 
         int normal_time = time_data->tm_hour % 12;
         if (normal_time == 0) 
@@ -62,6 +105,11 @@ int main()
         lseek(fd, 0, SEEK_SET);
         write(fd, time_string, 8);
 
+        lseek(fd, 7, SEEK_SET);
+
+        int dot = (time_data->tm_sec % 2);
+        ioctl(fd, SCREEN_CTL4_TOGGLE, &dot);
+
         FD_ZERO(&read);
         FD_SET(0, &read);
 
@@ -76,6 +124,7 @@ int main()
                 if(fgString[0] == 27)
                 {
                     printf("\n Exiting digital clock...\n");
+                    ioctl(fd, SCREEN_CTL1_DISABLE);
                     break;
                 }
                 printf("Command Typed: %s", fgString);
@@ -91,17 +140,25 @@ int main()
                 
                 else if(fgString[0] == '>')
                 {
-                    brightness += 0x01 ;
+                    if(brightness < 0x0F) brightness += 0x01 ;
                     ioctl(fd, SCREEN_CTL2_WRITE, &brightness);                    
                 }
                 else if(fgString[0] == '<')
                 {
-                    brightness -= 0x01;
+                    if(brightness > 0x00) brightness -= 0x01;
                     ioctl(fd, SCREEN_CTL2_WRITE, &brightness);
+                } 
+                else if(strncmp(fgString, "alarm ", 6) == 0)  // check over this 
+                {
+                    int offset = atoi(fgString + 6); 
+                    alarm_time = raw_time_int + offset;
+                    alarm_active = 1;
+                    printf("-> Alarm set for %d seconds.\n", offset);
                 }
                 
             }
         }
     }
+    close(fd);
     return 0;
 }
