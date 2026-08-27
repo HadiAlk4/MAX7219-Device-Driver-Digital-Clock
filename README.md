@@ -4,7 +4,7 @@ A Linux character device driver (`/dev/max_screen`) and interactive user-space d
 
 ## Features
 * **Kernel Driver:** Bit-banged SPI, hardware brightness control via IOCTLs, and automatic decimal-point cursor tracking.
-* **Digital Clock:** Real-time display, flashing seconds, live brightness adjustment (`<`/`>`), and a scrolling text alarm (`alarm X`, silenced with `#`).
+* **Digital Clock:** Real-time display, flashing seconds, live brightness adjustment (`<`/`>`), switch between `time` and `date`, and a scrolling text alarm (`alarm X`, silenced with `#`).
 
 ## Build & Run
 
