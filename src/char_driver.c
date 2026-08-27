@@ -21,18 +21,7 @@ static dev_t dev;
 static struct cdev my_cdev;
 static struct class *my_class;
 static char brightness_settings = 0x0F;
-static int decimal_toggle = 1;
 
-static char get_val(char c)
-{
-if(c >= '0' && c <= '9') return c - '0';
-if (c == 'E' || c == 'e') return 0x0B;
-if (c == 'H' || c == 'h') return 0x0C;
-if (c == 'L' || c == 'l') return 0x0D;
-if (c == 'P' || c == 'p') return 0x0E;
-if (c == '-') return 0x0A;
-return 0x0F;
-}
 
 static int my_open(struct inode *inode, struct file *file)
 {
@@ -143,8 +132,8 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
         val = 0x0F;
     }
 
-    
-    screen_send_bits(8 - curr, val); // screen_send_bits(curr+1, val);
+    screen_send_bits(8 - curr, val); // screen_send_bits(curr+1, val | 0x80);
+    //screen_send_bits(5, val | 0x80); // keep track of this bit and then wait for x number for seconds 
     
     buffer[curr] = c;
     
@@ -194,10 +183,7 @@ static long my_ioctl( struct file *filep, unsigned int command, unsigned long ar
             pr_info("EXECUTING SCREEN_CTL3, RETURNING (0x%x)\n", brightness_settings);
             ret=__put_user(brightness_settings,(unsigned char *)arg);
             break;
-        case SCREEN_CTL4_TOGGLE:
-            ret=__get_user(decimal_toggle, (int *)arg);
-            pr_info("EXECUTING SCREEN_CTL4, CURSOR TOGGLED TO: %d\n", decimal_toggle);
-            break;
+       
         default:
             ret= -ENOTTY;
     }
