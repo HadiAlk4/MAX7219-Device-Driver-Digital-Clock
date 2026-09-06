@@ -96,7 +96,7 @@ int main()
         }
 
         if(mode == 0) sprintf(time_string, "%02d-%02d-%02d", normal_time, time_data->tm_min, time_data->tm_sec);
-        if(mode == 1) sprintf(time_string, "%02d-%02d-%02d", time_data->tm_mday, time_data->tm_mon, time_data->tm_year);
+        if(mode == 1) sprintf(time_string, "%02d-%02d-%02d", time_data->tm_mday, time_data->tm_mon + 1, time_data->tm_year % 100);
         
         sprintf(alarm_string, "%02d-%02d-%02d", normal_time, time_data->tm_min, time_data->tm_sec + 10);
         

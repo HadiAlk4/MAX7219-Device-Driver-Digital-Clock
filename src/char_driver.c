@@ -61,7 +61,8 @@ static int my_release(struct inode *inode, struct file *file)
     {
         screen_send_bits(i, 0x0F);
     }
-    if(file->private_data){
+    if(file->private_data)
+    {
         kfree(file->private_data);
     }
     return 0;
@@ -158,7 +159,7 @@ static ssize_t my_write(struct file *file, const char __user *buf, size_t count,
     curr++;
     if(curr >= 8) curr = 0;
     
-        pr_info("screen my_write: %c \r\n", kernel_buf[i]);
+    pr_info("screen my_write: %c \r\n", kernel_buf[i]);
     }
 
     unsigned char final_val = get_val(buffer[curr]); // check this
@@ -229,7 +230,7 @@ static loff_t my_llseek( struct file *filep, loff_t offset, int whence){ // dumm
 
     char *buffer = (char *)filep->private_data;
 
-    // 1. Clear the dot from the old position
+    // clear the dot from the old position
     screen_send_bits(8 - curr, get_val(buffer[curr])); // check these two
     
     // check the possible seek methods

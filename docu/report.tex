@@ -1,0 +1,561 @@
+\documentclass[conference,a4paper]{IEEEtran}
+
+\IEEEoverridecommandlockouts
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+\else
+  \usepackage{fontspec}
+  \setmainfont{Times New Roman}
+  \setmonofont{Courier New}[Scale=0.92]
+\fi
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{placeins}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage{listings}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\tiny,
+  keywordstyle=\ttfamily\color{blue},
+  commentstyle=\itshape\color{gray},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=4pt,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=3pt,
+  xleftmargin=1.6em,
+  framexleftmargin=1.6em,
+  tabsize=4,
+  showstringspaces=false,
+  captionpos=b,
+  aboveskip=6pt,
+  belowskip=6pt,
+  morekeywords={loff_t,ssize_t,__user,kzalloc,copy_to_user,copy_from_user,
+                gpiod_set_value,gpiod_direction_output,gpio_to_desc,GFP_KERNEL}
+}
+
+\begin{document}
+
+\title{A Software-SPI Linux Character Device Driver\\for the MAX7219 Eight-Digit Display}
+
+\author{\IEEEauthorblockN{Hadi Alkhub}
+\IEEEauthorblockA{\textit{School of Information and Communication Technology}\\
+\textit{Griffith University}, Queensland, Australia\\
+Student ID: s5331680\\
+e-mail: hadi.alkhub@griffithuni.edu.au}
+}
+
+\maketitle
+
+\begin{abstract}
+This paper presents the architectural design, kernel implementation, and empirical validation of a Linux character device driver for an eight-digit, seven-segment MAX7219 display interfaced with a Raspberry~Pi~4. The hardware is exposed to user space through the Virtual File System (VFS) as \path{/dev/max_screen}. Communication uses a software bit-banged Serial Peripheral Interface (SPI) Mode~0 protocol via the Linux GPIO consumer descriptor framework. The driver implements standard file operations (\texttt{open}, \texttt{release}, \texttt{write}, \texttt{llseek}) and custom \texttt{ioctl} controls for blanking, digital intensity, and cursor visibility. Reentrancy and state encapsulation are maintained with a per-open shadow buffer in \texttt{file->private\_data}. Hardware cursor tracking is achieved by setting the decimal-point bit (\texttt{0x80}). Two user-space programs demonstrate the interface: a sequential automated test suite and an interactive, non-blocking digital clock with brightness stepping and a marquee alarm. Design alternatives---hardware SPI, static driver buffers, in-band control escapes, and per-function \texttt{switch} maps instead of \texttt{get\_val}---are evaluated and rejected. A root-cause analysis covers overloading of \texttt{f\_pos} in \texttt{my\_read}.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Linux device drivers, character device, MAX7219, bit-banged SPI Mode 0, GPIO consumer API, VFS, ioctl, Raspberry Pi 4.
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Device drivers form the abstraction layer in Unix-like operating systems that isolates raw hardware from user-space policy. Under Linux, peripherals appear as files in \texttt{/dev}, so \texttt{open()}, \texttt{read()}, \texttt{write()}, \texttt{lseek()}, and \texttt{ioctl()} are the uniform application interface.
+
+This project develops an out-of-tree Linux kernel module that presents an 8-digit, 7-segment LED display driven by the Maxim MAX7219~\cite{max7219} as a character device on a Raspberry~Pi~4. The laboratory brief imposes the following constraints~\cite{acs2026}:
+\begin{enumerate}
+    \item Communication must use software-generated (bit-banged) SPI Mode~0 over GPIO rather than the Raspberry~Pi hardware SPI master.
+    \item The current cursor position must be shown on the hardware by illuminating that digit's decimal point.
+    \item Brightness and cursor decimal-point toggling must use \texttt{ioctl}, not escape codes in the write stream.
+\end{enumerate}
+
+A central course principle is the separation of \textit{mechanism} from \textit{policy}. The driver provides mechanism only: GPIO bit serialization, spatial coordinate inversion, cursor tracking, and intensity register updates. User-space programs define policy: clock formatting, 1~Hz flashing, keybindings, and alarm timing.
+
+The remainder of this report is organized as follows. Section~\ref{sec:bg} reviews the MAX7219 and the Linux character-device model. Section~\ref{sec:arch} outlines the layered architecture and GPIO allocation. Section~\ref{sec:spi} justifies the software SPI implementation. Section~\ref{sec:kmod} details the kernel module. Section~\ref{sec:user} describes the user-space applications. Section~\ref{sec:issues} is a post-mortem of the \texttt{read} path and IOCTL diagnostics. Section~\ref{sec:eval} evaluates outcomes against the rubric, and Section~\ref{sec:conc} concludes.
+
+\section{Background and Theoretical Model}
+\label{sec:bg}
+
+\subsection{MAX7219 Hardware Operating Model}
+
+The Maxim MAX7219 is a common-cathode display multiplexer for up to eight 7-segment digits~\cite{max7219}. It contains an on-chip BCD Code-B decoder, an $8\times 8$ dual-port static RAM, multiplex scan circuitry, and a 16-step digital pulse-width modulation (PWM) intensity controller.
+
+Data transfer uses 16-bit serial packets, most-significant bit (MSB) first:
+\begin{equation}
+\mathrm{Packet}_{16} = (\mathrm{Address}_{8} \ll 8) \mid \mathrm{Data}_{8}.
+\end{equation}
+Bits $\mathrm{D}_{15}$--$\mathrm{D}_{12}$ are not relevant. Bits $\mathrm{D}_{11}$--$\mathrm{D}_{8}$ select the internal register ($0x0$--$0xF$), and bits $\mathrm{D}_{7}$--$\mathrm{D}_{0}$ are the payload. Active-low chip select (\texttt{LOAD}/\texttt{CS}) must stay low during transmission and rise with or after the 16th rising clock edge to latch the command. Clock idle-low with data sampled on the rising edge is SPI Mode~0.
+
+Table~\ref{tab:regs} lists the registers used by the driver.
+
+\begin{table}[H]
+\caption{MAX7219 essential register address map~\cite{max7219}.}
+\label{tab:regs}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\columnwidth}{l c Y}
+\toprule
+Register & Addr. & Description \\
+\midrule
+No-Op & \texttt{0x00} & Cascading / shift-register padding \\
+Digits 1--8 & \texttt{0x01}--\texttt{0x08} & Digit RAM (1~RHS \ldots{} 8~LHS) \\
+Decode Mode & \texttt{0x09} & \texttt{0xFF}: Code-B on all digits \\
+Intensity & \texttt{0x0A} & PWM from 1/32 (\texttt{0x00}) to 31/32 (\texttt{0x0F}) \\
+Scan Limit & \texttt{0x0B} & \texttt{0x07}: all eight digits \\
+Shutdown & \texttt{0x0C} & \texttt{0x01} normal, \texttt{0x00} shutdown \\
+Display Test & \texttt{0x0F} & \texttt{0x01} all LEDs on, \texttt{0x00} normal \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+With Code-B enabled (register \texttt{0x09} = \texttt{0xFF}), the font ROM maps a 4-bit nibble to $0$--$9$, dash (\texttt{0x0A}), \texttt{E} (\texttt{0x0B}), \texttt{H} (\texttt{0x0C}), \texttt{L} (\texttt{0x0D}), \texttt{P} (\texttt{0x0E}), and blank (\texttt{0x0F}). Bit~7 ($\mathrm{D}_7=\texttt{0x80}$) lights the decimal point independently of glyph decode.
+
+\subsection{Linux Kernel Device Driver Architecture}
+
+Modern Linux drivers are typically loadable kernel modules. A fully static kernel that bundled every peripheral would waste memory; \texttt{insmod} claims resources only when the hardware is present.
+
+Character drivers reach user space through the VFS via \texttt{struct file\_operations} in \texttt{<linux/fs.h>}. C99 designated initializers leave unused callbacks \texttt{NULL}:
+\begin{lstlisting}
+static struct file_operations fops = {
+    .owner          = THIS_MODULE,
+    .open           = my_open,
+    .release        = my_release,
+    .read           = my_read,
+    .write          = my_write,
+    .unlocked_ioctl = my_ioctl,
+    .llseek         = my_llseek,
+};
+\end{lstlisting}
+
+Pointers must not be dereferenced across the user/kernel boundary. Transfers use helpers from \texttt{<linux/uaccess.h>}:
+\begin{itemize}
+    \item \texttt{copy\_from\_user()} / \texttt{get\_user()}: import from user space; uncopied bytes or \texttt{-EFAULT} on bad addresses.
+    \item \texttt{copy\_to\_user()} / \texttt{put\_user()}: export to user space.
+\end{itemize}
+
+Errors are negative \texttt{errno} values from \texttt{<linux/errno.h>}:
+\begin{itemize}
+    \item \texttt{-EFAULT}: unmapped address during a copy.
+    \item \texttt{-EINVAL}: invalid parameter (e.g., bad seek origin).
+    \item \texttt{-ENOMEM}: allocator failure.
+    \item \texttt{-ENOTTY}: unknown or inappropriate \texttt{ioctl}.
+\end{itemize}
+
+\section{System Architecture}
+\label{sec:arch}
+
+VFS abstraction, register logic, and GPIO toggling are split across source files. Fig.~\ref{fig:arch} shows the layers.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\scriptsize,
+  box/.style={draw, rounded corners=1pt, align=center,
+              inner sep=3pt, text width=0.88\columnwidth},
+  arr/.style={-{Latex}, thick}
+]
+\node[box, fill=gray!12] (user) {\textbf{User space}\\
+\texttt{digital\_clock.c}, \texttt{program\_test\_1.c}\\
+(\texttt{open}, \texttt{write}, \texttt{lseek}, \texttt{ioctl}, \texttt{select})};
+\node[box, fill=blue!8, below=3.5mm of user] (vfs) {\textbf{VFS:} \path{/dev/max_screen}\\
+major/minor numbers, inode management};
+\node[box, fill=green!10, below=3.5mm of vfs] (drv) {\textbf{Character driver (\texttt{char\_driver.c})}\\
+Code-B translation, cursor shadowing, VFS callbacks};
+\node[box, fill=orange!15, below=3.5mm of drv] (gpio) {\textbf{HAL (\texttt{gpio\_setup.c})}\\
+software SPI Mode~0, register sequencer};
+\node[box, fill=yellow!20, below=3.5mm of gpio] (ic) {\textbf{Hardware}\\
+MAX7219 multiplexer + 8-digit display};
+\draw[arr] (user) -- (vfs);
+\draw[arr] (vfs) -- (drv);
+\draw[arr] (drv) -- (gpio);
+\draw[arr] (gpio) -- (ic);
+\end{tikzpicture}
+\caption{Layered architecture: applications, VFS operations, and bit-banged SPI.}
+\label{fig:arch}
+\end{figure}
+
+The source tree is:
+\begin{itemize}
+    \item \texttt{src/char\_driver.c}: module init, device-number allocation, sysfs class, and VFS callbacks.
+    \item \texttt{src/gpio\_setup.c}: GPIO descriptors, SPI Mode~0 bit-banging, and display setup.
+    \item \texttt{src/gpio\_setup.h}: prototypes for the SPI helpers.
+    \item \texttt{Makefile}: Kbuild \texttt{obj-m} multi-part build, load, node permissions, and user programs.
+\end{itemize}
+
+\FloatBarrier
+\section{Hardware Interfacing and Bit-Banged SPI}
+\label{sec:spi}
+
+\subsection{Software SPI Justification}
+
+The Raspberry~Pi~4 exposes a hardware SPI master through \texttt{spi-bcm2835}. Hardware SPI was rejected for two reasons:
+\begin{enumerate}
+    \item \textbf{Specification:} the brief forbids the kernel SPI subsystem and requires synthesizing the protocol on GPIO~\cite{acs2026}.
+    \item \textbf{Pin flexibility:} bit-banging can use arbitrary GPIOs without pinmux contention on the dedicated SPI0 pins.
+\end{enumerate}
+
+\subsection{Pin Mapping and the GPIO Consumer API}
+
+Older modules used integer GPIO numbers from \texttt{<linux/gpio.h>}. Current kernels prefer the descriptor consumer API in \texttt{<linux/gpio/consumer.h>}. On 64-bit Debian kernels for the BCM2711, the GPIO chip base is typically 512, so BCM index $n$ is
+\begin{equation}
+\text{global descriptor index} = 512 + n.
+\end{equation}
+
+Table~\ref{tab:pins} lists the mapping. BCM GPIOs 26, 19, and 13 sit on header pins 37, 35, and 33, which shortens wiring and leaves SPI0 (GPIO~8--11) unused.
+
+\begin{table}[H]
+\caption{Hardware interface pin connections.}
+\label{tab:pins}
+\centering
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\columnwidth}{l Y c c}
+\toprule
+Signal & Role & BCM & Offset \\
+\midrule
+\texttt{DIN} & Serial data in & 26 & 538 \\
+\texttt{CLK} & Serial clock & 19 & 531 \\
+\texttt{CS}  & Chip select & 13 & 525 \\
+\texttt{VCC} & 5\,V supply & Pin~2 & --- \\
+\texttt{GND} & Ground & Pin~39 & --- \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Bit-Banging Mechanics and Timing}
+
+The MAX7219 allows $f_{\mathrm{CLK}}$ up to 10~MHz (100~ns period). Minimum clock high/low times $t_{\mathrm{CH}}$, $t_{\mathrm{CL}}$ are 50~ns; data setup $t_{\mathrm{DS}}$ is 25~ns~\cite{max7219}. Serialization in \texttt{gpio\_setup.c} is:
+
+\begin{lstlisting}
+void screen_send_bits(unsigned char address,
+                      unsigned char data)
+{
+    int bits_to_send = (address << 8) | data;
+    gpiod_set_value(cs_gpio13, 0);
+
+    for (int i = 0; i <= 15; i++) {
+        int curr_bit =
+            (bits_to_send >> (15 - i)) & 1;
+        gpiod_set_value(din_gpio26, curr_bit);
+        gpiod_set_value(clk_gpio19, 1); /* latch */
+        gpiod_set_value(clk_gpio19, 0); /* idle */
+    }
+    gpiod_set_value(cs_gpio13, 1); /* execute */
+}
+\end{lstlisting}
+
+Prototype code under \texttt{gpio test/} used \texttt{udelay(1)}; the production path does not insert extra delays.
+
+\subsection{Coordinate Orientation}
+
+On typical 8-digit MAX7219 modules, digit~1 (register \texttt{0x01}) is the rightmost element and digit~8 (\texttt{0x08}) is the leftmost~\cite{max7219}. Unix strings index 0 on the left. The driver maps
+\begin{equation}
+\text{hardware address} = 8 - \text{cursor position}.
+\end{equation}
+At $\mathrm{curr}=0$ the byte goes to register~8 (leftmost digit), matching left-to-right text.
+
+\FloatBarrier
+\section{Kernel Module Design and Implementation}
+\label{sec:kmod}
+
+\subsection{Module Lifecycle and Sysfs}
+
+Registration in \texttt{screen\_init()} uses dynamic allocation:
+\begin{enumerate}
+    \item \texttt{alloc\_chrdev\_region()} reserves a major number and minor~0.
+    \item \texttt{cdev\_init()} binds the \texttt{cdev} to \texttt{fops}.
+    \item \texttt{cdev\_add()} registers the instance.
+    \item \texttt{class\_create("my\_class")} and \texttt{device\_create()} publish \path{/sys/class/my_class/max_screen}. \texttt{udevd} then creates \path{/dev/max_screen}.
+\end{enumerate}
+
+On \texttt{screen\_exit()}, the driver shuts the display down (\texttt{0x0C}, \texttt{0x00}), removes sysfs nodes, deletes the \texttt{cdev}, unregisters numbers, and idles the GPIOs.
+
+\subsection{Display Initialization and Lamp Test}
+
+\texttt{start\_display()} programs known register values:
+\begin{itemize}
+    \item Decode (\texttt{0x09} $\leftarrow$ \texttt{0xFF}): Code-B on all digits.
+    \item Intensity (\texttt{0x0A} $\leftarrow$ \texttt{0x0F}): maximum PWM.
+    \item Scan limit (\texttt{0x0B} $\leftarrow$ \texttt{0x07}): eight digits.
+    \item Shutdown (\texttt{0x0C} $\leftarrow$ \texttt{0x01}): normal operation.
+    \item Display test (\texttt{0x0F} $\leftarrow$ \texttt{0x00}): test mode off.
+\end{itemize}
+
+\texttt{my\_open()} writes \texttt{0x0F},\texttt{0x01} (all segments on), sleeps five seconds with \texttt{msleep(5000)}, then restores \texttt{0x0F},\texttt{0x00}, meeting the lamp-test requirement~\cite{acs2026}.
+
+\subsection{State Management and Shadow Buffering}
+
+\texttt{my\_open()} allocates an 8-byte kernel shadow:
+\begin{lstlisting}
+char *buff = kzalloc(8 * sizeof(char), GFP_KERNEL);
+file->private_data = buff;
+file->f_pos = 0;
+\end{lstlisting}
+The kernel \texttt{struct file} provides \texttt{private\_data} specifically so a driver can attach per-open device state rather than a global buffer~\cite{lklabs}. Storing the shadow there keeps concurrent opens isolated. \texttt{kfree()} runs in \texttt{my\_release()}.
+
+\subsection{Code-B Translation (\texttt{get\_val})}
+
+The decoder accepts a small character set~\cite{max7219}. A \texttt{switch} (or long \texttt{if} chain) in \texttt{my\_write()}, \texttt{my\_llseek()}, and \texttt{my\_ioctl()} would duplicate the same map and drift out of sync. Translation is therefore factored into one helper:
+\begin{lstlisting}
+static char get_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == 'E' || c == 'e') return 0x0B;
+    if (c == 'H' || c == 'h') return 0x0C;
+    if (c == 'L' || c == 'l') return 0x0D;
+    if (c == 'P' || c == 'p') return 0x0E;
+    if (c == '-')             return 0x0A;
+    return 0x0F; /* blank */
+}
+\end{lstlisting}
+ASCII digits are contiguous: \texttt{c - '0'} yields Code-B $0x00$--$0x09$.
+
+\subsection{Write Semantics and Wrapping}
+
+\texttt{my\_write()} \texttt{kmalloc}s a staging buffer and \texttt{copy\_from\_user}s the payload. For each character:
+\begin{enumerate}
+    \item \texttt{\textbackslash n} and \texttt{\textbackslash r} are skipped so \texttt{echo} works cleanly.
+    \item The glyph is sent to register $8-\mathrm{curr}$.
+    \item ASCII is stored in \texttt{buffer[curr]}.
+    \item \texttt{curr} advances and wraps from 7 to 0.
+\end{enumerate}
+After the loop, if cursor tracking is on, \texttt{0x80} is OR-ed onto the resting digit.
+
+\subsection{File Repositioning (\texttt{my\_llseek})}
+
+\texttt{SEEK\_SET}, \texttt{SEEK\_CUR}, and \texttt{SEEK\_END} are supported. On a seek:
+\begin{enumerate}
+    \item The old digit is rewritten without \texttt{0x80}, clearing its decimal point.
+    \item The new offset is computed from \texttt{whence} and clamped to $[0,7]$.
+    \item The glyph at the new index is resent, with \texttt{0x80} if the cursor is visible.
+    \item \texttt{filep->f\_pos} is updated and returned.
+\end{enumerate}
+
+This encodes a single-cursor model: at most one decimal point, tied to \texttt{f\_pos}.
+
+\subsection{The IOCTL Interface}
+
+Commands use magic number \texttt{'k'}:
+\begin{itemize}
+    \item \texttt{SCREEN\_CTL1\_DISABLE} (\texttt{\_IO}): blank all digits with Code-B \texttt{0x0F}, clear the shadow, reset the cursor to~0.
+    \item \texttt{SCREEN\_CTL2\_WRITE} (\texttt{\_IOW}): \texttt{\_\_get\_user} an intensity byte, clamp to \texttt{0x0F}, store it, write register \texttt{0x0A}.
+    \item \texttt{SCREEN\_CTL3\_READ} (\texttt{\_IOR}): \texttt{\_\_put\_user} the saved intensity.
+    \item \texttt{SCREEN\_CTL4\_TOGGLE} (\texttt{\_IOW}): set cursor-DP visibility and refresh register $8-\mathrm{curr}$.
+\end{itemize}
+
+\subsection{Seconds Decimal-Point Blink}
+
+The clock blinks the rightmost digit by seeking to file position~7 and passing $\mathrm{tm\_sec} \bmod 2$ into \texttt{SCREEN\_CTL4\_TOGGLE} on each refresh. Even seconds clear the decimal point; odd seconds set it.
+
+\section{User-Space Applications}
+\label{sec:user}
+
+\subsection{Automated Validation (\texttt{program\_test\_1.c})}
+
+The test program exercises the interface in order:
+\begin{enumerate}
+    \item \textbf{IOCTL probe:} \texttt{SCREEN\_CTL3\_READ} for default intensity.
+    \item \textbf{Write:} numeric strings and Code-B translation.
+    \item \textbf{Seek:} \texttt{SEEK\_SET}, \texttt{SEEK\_CUR}, \texttt{SEEK\_END} and DP relocation.
+    \item \textbf{PWM:} intensity \texttt{0x01} and \texttt{0x0F}.
+    \item \textbf{Blank:} \texttt{SCREEN\_CTL1\_DISABLE} on exit.
+\end{enumerate}
+
+\subsection{Interactive Digital Clock (\texttt{digital\_clock.c})}
+
+The demonstration clock formats \texttt{localtime()} as \texttt{HH-MM-SS} (12-hour) or \texttt{DD-MM-YY} (calendar).
+
+\subsubsection{Non-Blocking Event Loop}
+A 1~Hz-style refresh must not block on \texttt{fgets()}. \texttt{select()} watches stdin with a 100~ms timeout:
+\begin{lstlisting}
+FD_ZERO(&read_fds);
+FD_SET(0, &read_fds);
+halt.tv_sec  = 0;
+halt.tv_usec = 100000; /* 100 ms */
+
+if (select(1, &read_fds, NULL, NULL, &halt) > 0) {
+    if (fgets(fgString, sizeof(fgString),
+              stdin) != NULL) {
+        /* parse command */
+    }
+}
+\end{lstlisting}
+
+\subsubsection{Flashing Seconds Indicator}
+The brief asks for a one-second flash on the rightmost digit~\cite{acs2026}. The clock \texttt{lseek}s to position~7 and calls \texttt{ioctl(..., SCREEN\_CTL4\_TOGGLE, \&dot)} with $\mathrm{tm\_sec} \bmod 2$.
+
+\subsubsection{Marquee Alarm}
+\texttt{alarm X} sets $t_{\mathrm{alarm}}=t_{\mathrm{now}}+X$. When the deadline is reached, an 8-character window slides across a padded dash string (\texttt{"~~~~~-----~~~~~"} with leading/trailing spaces) every 200~ms via \texttt{lseek(0)} and \texttt{write()}. \texttt{select()} still watches stdin; \texttt{\#} clears the alarm and returns to the clock.
+
+\subsubsection{Brightness and Exit}
+Keys \texttt{>} and \texttt{<} step PWM across all levels. Escape (ASCII~27) sends \texttt{SCREEN\_CTL1\_DISABLE}, closes the descriptor, and exits.
+
+\section{Diagnostic Analysis and Implementation Issues}
+\label{sec:issues}
+
+\subsection{Root-Cause Analysis of \texttt{my\_read}}
+\label{sec:read}
+
+The assignment requires \texttt{read()} to return characters from the leftmost digit up to the cursor~\cite{acs2026}. The shadow buffer holds those characters, but \texttt{my\_read()} returns no useful data.
+
+\begin{lstlisting}[caption={Flawed length and EOF checks in \texttt{my\_read}.}]
+if (*fpos > 0)
+    return 0; /* treated as EOF */
+
+if (count > filep->f_pos)
+    count = filep->f_pos;
+if (count == 0)
+    return 0;
+\end{lstlisting}
+
+The defect is \textbf{overloading \texttt{file->f\_pos} as both a circular cursor and a sequential file offset}:
+\begin{enumerate}
+    \item After \texttt{open}, \texttt{f\_pos}=0, so \texttt{count} is clamped to 0 and the call returns empty.
+    \item After a write, \texttt{f\_pos}$>0$, but \texttt{if(*fpos > 0) return 0;} treats the cursor as end-of-file.
+    \item Assigning \texttt{*fpos = ret} then corrupts the display cursor.
+\end{enumerate}
+
+\subsubsection{Architectural Resolution}
+Separate the circular cursor from the stream offset in a per-open struct:
+\begin{lstlisting}
+struct max_screen_dev {
+    char shadow[8];
+    unsigned int cursor_pos;
+    unsigned int read_offset;
+};
+\end{lstlisting}
+\texttt{cursor\_pos} tracks the decimal point; \texttt{read\_offset} tracks VFS consumption.
+
+
+\FloatBarrier
+\section{Evaluation and Experimental Validation}
+\label{sec:eval}
+
+The suite was run on a Raspberry~Pi~4 Model~B. Table~\ref{tab:eval} maps features to status.
+
+\begin{table}[H]
+\caption{Rubric specification compliance.}
+\label{tab:eval}
+\centering
+\setlength{\tabcolsep}{2.5pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\columnwidth}{>{\raggedright\scriptsize}p{0.20\columnwidth}
+                               >{\raggedright\scriptsize}Y
+                               >{\centering\scriptsize\arraybackslash}p{0.16\columnwidth}}
+\toprule
+Feature & Mechanism & Status \\
+\midrule
+Open lamp test & \texttt{my\_open}: \texttt{0x0F,0x01}, 5\,s & Pass \\
+Close clear & \texttt{my\_release}: Code-B blank 1--8 & Pass \\
+SPI Mode~0 & GPIO consumer bit-bang & Pass \\
+Cursor track & DP bit \texttt{0x80} & Pass \\
+Circular write & Code-B map, $8-\mathrm{curr}$ & Pass \\
+Seek & \texttt{SET}/\texttt{CUR}/\texttt{END} & Pass \\
+IOCTL & Blank, intensity, DP toggle & Pass \\
+Clock & 12-hour + flashing seconds & Pass \\
+Marquee alarm & Sliding window, `\#' cancel & Pass \\
+\texttt{read()} & LHS through cursor & \textbf{Fail} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Conclusion and Future Work}
+\label{sec:conc}
+
+This paper presented a Linux character device driver and user-space suite for a MAX7219 8-digit display on a Raspberry~Pi~4. Bit-banged SPI Mode~0 on GPIO maps the protocol onto standard Unix file operations and keeps mechanism separate from policy.
+
+Development required Code-B refactoring, a \texttt{select()}-based clock loop, and IOCTL direction alignment. The \texttt{my\_read()} post-mortem shows that circular cursor state must not share \texttt{f\_pos} with sequential reads. Future work includes the in-kernel SPI master with Device Tree overlays and hardware-timed PWM~\cite{max7219}.
+
+\begin{thebibliography}{00}
+
+\bibitem{acs2026}
+Advanced Computer Systems, ``Device driver project: weeks 4--7,'' School of Information and Communication Technology, Griffith University, Course Specification, 2026.
+
+\bibitem{max7219}
+Maxim Integrated, \emph{MAX7219/MAX7221 Serially Interfaced, 8-Digit LED Display Drivers}, Datasheet 19-4452, Rev.~4, 1996.
+
+\bibitem{lklabs}
+Linux Kernel Labs, ``Character device drivers,'' \emph{The Linux Kernel} documentation. [Online]. Available: \url{https://linux-kernel-labs.github.io/refs/heads/master/labs/device_drivers.html}
+
+\end{thebibliography}
+
+\appendices
+
+\section{Build, Deployment, and Verification}
+
+\begin{lstlisting}[language=bash, numbers=none]
+# Compile module and user programs
+make
+make digital_clock
+make program_test_1
+
+# Load the driver
+sudo insmod max_screen_driver.ko
+
+# Logs and node
+dmesg | tail -n 15
+ls -l /dev/max_screen
+cat /proc/devices | grep max_screen
+
+# Tests
+./program_test_1
+./digital_clock
+
+# Unload
+sudo rmmod max_screen_driver
+make clean
+\end{lstlisting}
+
+\section{Proposed Structure-Based \texttt{my\_read}}
+
+This sketch separates stream offset from the display cursor (Section~\ref{sec:read}):
+
+\begin{lstlisting}
+struct max_screen_dev {
+    char shadow_buf[8];
+    unsigned int cursor_pos;
+    unsigned int read_offset;
+};
+
+static ssize_t robust_read(struct file *filep,
+        char __user *user_buf, size_t count,
+        loff_t *fpos)
+{
+    struct max_screen_dev *dev =
+        filep->private_data;
+    size_t available, to_copy;
+
+    if (dev->read_offset >= dev->cursor_pos)
+        return 0;
+
+    available = dev->cursor_pos - dev->read_offset;
+    to_copy = min(count, available);
+
+    if (copy_to_user(user_buf,
+            dev->shadow_buf + dev->read_offset,
+            to_copy))
+        return -EFAULT;
+
+    dev->read_offset += to_copy;
+    return to_copy;
+}
+\end{lstlisting}
+
+\end{document}
